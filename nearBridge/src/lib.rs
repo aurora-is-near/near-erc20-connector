@@ -1,14 +1,10 @@
+use near_plugins::{only, pause, FullAccessKeyFallback, Ownable, Pausable, Upgradable};
 /**
 * Bridge for Near Native token
 */
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::UnorderedSet;
 use near_sdk::{env, ext_contract, near_bindgen, AccountId, Balance, Gas, PanicOnDefault, Promise};
-
-use admin_controlled::{AdminControlled, Mask};
-
-near_sdk::setup_alloc!();
-
 use prover::ext_prover;
 pub use prover::{get_eth_address, is_valid_eth_address, EthAddress, Proof};
 pub use transfer_to_near_event::TransferToNearInitiatedEvent;
@@ -17,15 +13,12 @@ pub mod prover;
 mod transfer_to_near_event;
 
 /// Gas to call finalise method.
-const FINISH_FINALISE_GAS: Gas = 50_000_000_000_000;
+const FINISH_FINALISE_GAS: Gas = Gas(50 * Gas::ONE_TERA.0);
 
 const NO_DEPOSIT: Balance = 0;
 
 /// Gas to call verify_log_entry on prover.
-const VERIFY_LOG_ENTRY_GAS: Gas = 50_000_000_000_000;
-
-const PAUSE_MIGRATE_TO_ETH: Mask = 1 << 0;
-const PAUSE_ETH_TO_NEAR_TRANSFER: Mask = 1 << 1;
+const VERIFY_LOG_ENTRY_GAS: Gas = Gas(50 * Gas::ONE_TERA.0);
 
 #[derive(Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub enum ResultType {
@@ -36,7 +29,15 @@ pub enum ResultType {
 }
 
 #[near_bindgen]
-#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    PanicOnDefault,
+    Ownable,
+    Pausable,
+    FullAccessKeyFallback,
+    Upgradable,
+)]
 pub struct NearBridge {
     /// The account of the prover that we can use to prove
     pub prover_account: AccountId,
@@ -47,20 +48,19 @@ pub struct NearBridge {
     /// Hashes of the events that were already used.
     pub used_events: UnorderedSet<Vec<u8>>,
 
-    /// Mask determining all paused functions
-    paused: Mask,
+    // Deprecated field. Requires migration to be removed.
+    __paused: u128,
 }
 
 #[near_bindgen]
 impl NearBridge {
     #[init]
     pub fn new(prover_account: AccountId, e_near_address: String) -> Self {
-        assert!(!env::state_exists(), "Already initialized");
         Self {
             prover_account,
             e_near_address: get_eth_address(e_near_address),
             used_events: UnorderedSet::new(b"u".to_vec()),
-            paused: Mask::default(),
+            __paused: Default::default(),
         }
     }
 
@@ -71,25 +71,26 @@ impl NearBridge {
     /// * Caller of the method has to attach deposit enough to cover:
     ///   * The `amount` of Near tokens being bridged, and
     ///   * The storage difference at the fixed storage price defined in the contract.
+    #[pause]
     #[payable]
     #[result_serializer(borsh)]
-    // todo: how much GAS is required to execute this method with sending the tokens back and ensure we have enough
+    // TODO: how much GAS is required to execute this method with sending the tokens back and ensure we have enough
     pub fn migrate_to_ethereum(&mut self, eth_recipient: String) -> ResultType {
-        self.check_not_paused(PAUSE_MIGRATE_TO_ETH);
-
         // Predecessor must attach Near to migrate to ETH
         let attached_deposit = env::attached_deposit();
-        if attached_deposit == 0 {
-            env::panic(b"Attached deposit must be greater than zero");
-        }
+        assert_ne!(
+            attached_deposit, 0,
+            "Attached deposit must be greater than zero"
+        );
 
         // If the method is paused or the eth recipient address is invalid, then we need to:
         //  1) Return the attached deposit
         //  2) Panic and tell the user why
         let eth_recipient_clone = eth_recipient.clone();
-        if !is_valid_eth_address(eth_recipient_clone) {
-            env::panic(b"ETH address is invalid");
-        }
+        assert!(
+            is_valid_eth_address(eth_recipient_clone),
+            "ETH address is invalid"
+        );
 
         ResultType::MigrateNearToEthereum {
             amount: attached_deposit,
@@ -97,10 +98,9 @@ impl NearBridge {
         }
     }
 
+    #[pause]
     #[payable]
     pub fn finalise_eth_to_near_transfer(&mut self, #[serializer(borsh)] proof: Proof) {
-        self.check_not_paused(PAUSE_ETH_TO_NEAR_TRANSFER);
-
         let event = TransferToNearInitiatedEvent::from_log_entry_data(&proof.log_entry_data);
         assert_eq!(
             event.e_near_address,
@@ -120,7 +120,7 @@ impl NearBridge {
             proof.header_data,
             proof.proof,
             false, // Do not skip bridge call. This is only used for development and diagnostics.
-            &self.prover_account,
+            self.prover_account.clone(),
             NO_DEPOSIT,
             VERIFY_LOG_ENTRY_GAS,
         )
@@ -128,7 +128,7 @@ impl NearBridge {
             event.recipient,
             event.amount,
             proof_1,
-            &env::current_account_id(),
+            env::current_account_id(),
             env::attached_deposit(),
             FINISH_FINALISE_GAS,
         ));
@@ -136,6 +136,7 @@ impl NearBridge {
 
     /// Finish depositing once the proof was successfully validated. Can only be called by the contract
     /// itself.
+    #[only(self)]
     #[payable]
     pub fn finish_eth_to_near_transfer(
         &mut self,
@@ -146,13 +147,14 @@ impl NearBridge {
         #[serializer(borsh)] amount: Balance,
         #[serializer(borsh)] proof: Proof,
     ) {
-        near_sdk::assert_self();
         assert!(verification_success, "Failed to verify the proof");
 
         let required_deposit = self.record_proof(&proof);
-        if env::attached_deposit() < required_deposit {
-            env::panic(b"Attached deposit is not sufficient to record proof");
-        }
+
+        assert!(
+            env::attached_deposit() >= required_deposit,
+            "Attached deposit is not sufficient to record proof"
+        );
 
         Promise::new(new_owner_id).transfer(amount);
     }
@@ -163,10 +165,10 @@ impl NearBridge {
     }
 
     /// Record proof to make sure it is not re-used later for anther deposit.
+    #[only(self)]
     fn record_proof(&mut self, proof: &Proof) -> Balance {
         // TODO: Instead of sending the full proof (clone only relevant parts of the Proof)
         //       log_index / receipt_index / header_data
-        near_sdk::assert_self();
         let initial_storage = env::storage_usage();
         let proof_key = proof.get_key();
         assert!(
@@ -196,8 +198,6 @@ pub trait ExtNearBridge {
         #[serializer(borsh)] proof: Proof,
     ) -> Promise;
 }
-
-admin_controlled::impl_admin_controlled!(NearBridge, paused);
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
@@ -236,10 +236,10 @@ mod tests {
     }
 
     fn alice_near_account() -> AccountId {
-        "alice.near".to_string()
+        "alice.near".to_string().try_into().unwrap()
     }
     fn prover_near_account() -> AccountId {
-        "prover".to_string()
+        "prover".to_string().try_into().unwrap()
     }
     fn e_near_eth_address() -> String {
         "68a3637ba6e75c0f66b61a42639c4e9fcd3d4824".to_string()
@@ -282,7 +282,7 @@ mod tests {
                 .unwrap(),
             sender: "00005474e89094c44da98b954eedeac495271d0f".to_string(),
             amount: 1000,
-            recipient: "123".to_string(),
+            recipient: "123".to_string().try_into().unwrap(),
         };
 
         Proof {

@@ -2,6 +2,7 @@ use crate::prover::{EthAddress, EthEvent, EthEventParams};
 use ethabi::{ParamType, Token};
 use hex::ToHex;
 use near_sdk::{AccountId, Balance};
+use std::convert::TryInto;
 
 /// Data that was emitted by the Ethereum TransferToNearInitiated event.
 #[derive(Debug, Eq, PartialEq)]
@@ -41,7 +42,7 @@ impl TransferToNearInitiatedEvent {
             e_near_address: event.locker_address,
             sender,
             amount,
-            recipient,
+            recipient: recipient.try_into().unwrap(),
         }
     }
 
@@ -53,7 +54,7 @@ impl TransferToNearInitiatedEvent {
             vec![hex::decode(self.sender.clone()).unwrap()],
             vec![
                 Token::Uint(self.amount.into()),
-                Token::String(self.recipient.clone()),
+                Token::String(self.recipient.to_string()),
             ],
         )
     }
@@ -79,7 +80,7 @@ mod tests {
             e_near_address: [0u8; 20],
             sender: "00005474e89094c44da98b954eedeac495271d0f".to_string(),
             amount: 1000,
-            recipient: "123".to_string(),
+            recipient: "123".to_string().try_into().unwrap(),
         };
         let data = event_data.to_log_entry_data();
         let result = TransferToNearInitiatedEvent::from_log_entry_data(&data);
